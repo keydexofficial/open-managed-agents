@@ -285,12 +285,21 @@ ACP 的合理用途：
 
 ### 3.7 打包与运行时
 
-- 构建入口：`build.ts`，`Bun.build` target `node`，输出 `dist/cli.js`（约 27 MiB）并复制 `vendor/`。
-- `vendor/` 包含 linux x64/arm64 的 ripgrep，Grep/Glob 依赖它。
-- Node 要求 `>=20`（`package.json` engines）。
-- 构建时硬编码 `process.env.DISABLE_TELEMETRY = "1"`（`build.ts:20`），因此 dist 版本默认关闭 1P telemetry。
-- `--version` 输出 `${MACRO.VERSION} (Claude Code)`，当前 `MACRO.VERSION=0.1.53`（`scripts/defines.ts:10`、`src/main.tsx:5159-5161`）。
-- 产物仍是 Node 脚本，需要镜像内提供 Node 20；或者改用 `bun build --compile` 生成单文件，但当前构建脚本没有这样做。
+`build.ts` 已经覆盖了“把代码打成可运行产物”这件事的大部分：
+
+- `Bun.build` 以 `src/entrypoints/cli.tsx` 为入口、`target: node` 输出 `dist/cli.js`（约 27 MiB）。
+- 递归复制 `vendor/` 到 `dist/vendor/`，包含 Linux x64/arm64 的 ripgrep；`src/utils/ripgrep.ts:58` 通过 `__dirname/vendor/ripgrep` 定位它。
+- 把 Bun 专用的 `import.meta.require` 替换为 Node 兼容的 `createRequire`（`build.ts:52-69`）。
+- 实测 `Bun.build` 产出的 `dist/cli.js` 带 `#!/usr/bin/env node` 且可直接执行；在本机 macOS 上，`copyFile` 也保留了 vendor 可执行位。Linux 镜像构建时仍应复核一次权限位。
+- 构建时硬编码 `process.env.DISABLE_TELEMETRY = "1"`（`build.ts:20`），dist 版本默认关闭 1P telemetry。
+
+但仍然有三件事不属于 `build.ts` 的职责：
+
+1. **Node 20 运行时**：产物仍是 `#!/usr/bin/env node` 脚本，镜像必须提供 Node `>=20`（`package.json` engines）。如果要单文件无 Node 依赖，需要额外采用 `bun build --compile`，当前构建脚本没有做。
+2. **镜像布局**：必须复制整个 `dist/`（`cli.js` + `vendor/`），不能只复制 `cli.js`。可以直接把 `environment_runner.claude_path` 指向 `/opt/langcli/dist/cli.js`，也可以在该路径放 wrapper 或 symlink 到 `/opt/claude-code/bin/claude`。Node 会把入口 symlink 解析为真实路径，因此 `__dirname/vendor` 仍能命中；但为了显式控制环境和路径，wrapper 更稳。
+3. **sandbox 环境加固**：`CLAUDE_CONFIG_DIR`、`DISABLE_AUTOUPDATER`、`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` 需要在启动前注入；这些不是 `build.ts` 能解决的，应放在 environment-manager payload、launcher 环境或 wrapper 中。
+
+另外，`scripts/defines.ts:10` 把 `MACRO.VERSION` 硬编码为 `0.1.53`，不是从 `package.json` 读取；发布时容易出现包版本与 `--version` 输出不一致，需要在发布流程中校验。
 
 ---
 
@@ -298,7 +307,7 @@ ACP 的合理用途：
 
 | 合同项 | OMA 要求 | Langcli 现状 | 判断与动作 |
 | --- | --- | --- | --- |
-| CLI 路径与可执行性 | `/opt/claude-code/bin/claude` 或 `claude_path` 指向可执行文件 | Node 脚本，需要 wrapper | 提供 wrapper 或改 `claude_path` |
+| CLI 路径与可执行性 | `/opt/claude-code/bin/claude` 或 `claude_path` 指向可执行文件 | `dist/cli.js` 可直接执行；需 Node 20 + 整个 `dist/` | 改 `claude_path`、wrapper 或 symlink；注入 env |
 | `--version` | environment-manager `current` 模式读取 | 输出 `0.1.53 (Claude Code)` | 需实测解析规则；必要时 wrapper 输出兼容版本 |
 | `--sdk-url` | 进入 remote/CCRv2 模式 | 自动 print + stream-json | 匹配 |
 | `--settings` | `/root/.claude/launcher-settings.json` | 支持 flag settings | 匹配 |
@@ -354,7 +363,28 @@ ACP 的合理用途：
 - **镜像清理**：删除 `/root/.claude/settings.json`、`/root/.langcli`、登录状态，避免 `modelType`/`modelProviders` 污染。
 - **回归测试**：分别用 `oma/kimi-k2.5`、裸 `kimi-k2.5`、`deepseek-flash` 启动，断言只出现 `/v1/messages`，不出现 `/v1/chat/completions`。
 
+**补充：不建议直接把 OMA 模型名全部改成 Langcli/LangRouter 名**
+
+改名本身不能解决模型路由问题，取决于请求是否仍经过 OMA：
+
+| 方案 | 结果 |
+| --- | --- |
+| OMA 公共模型名改为 `kimi-k2.5` 等裸名，请求仍走 OMA `/v1/messages` | Langcli 命中 `CANONICAL_ID_TO_PROTOCOL`，改走 OpenAI 协议，请求 `/v1/chat/completions`；OMA 拒绝 sandbox code session。仍然需要“强制 firstParty”补丁，改名前后的差别只是让问题更容易触发 |
+| OMA 公共模型名改为 LangRouter 名，Langcli 直连 LangRouter | 模型名对齐了，但进入 BYOK/直连架构：`ANTHROPIC_BASE_URL` 冲突、OMA 模型代理/计费/预算/观测/文件引用丢失、key 进入 sandbox。改名不是主要成本，架构变化才是 |
+| 保留 `{slug}/{upstream}`，OMA 内部把 LangRouter 作为 Provider | Langcli 看到 `langrouter/kimi-k2.5`，不命中 canonical，走 `/v1/messages`；OMA 转发时去掉 slug，LangRouter 收到 `kimi-k2.5`。这是最小改动且不破坏公共 ID |
+
+不建议把公共模型 ID 直接绑定到 Langcli 的别名表，原因：
+
+- Langcli 的 `kimi-k2.5`、`deepseek-flash`、`glm-5.2` 是 CLI 别名，不是稳定的上游模型 ID；Langcli 的 CHANGELOG 会随版本改模型名和别名，OMA 的持久化模型 ID 会跟着漂移。
+- OMA 的 `{slug}/{upstream_model_id}` 用于区分不同 Provider 下的同名模型；改成裸名会重新引入歧义。
+- 模型 ID 分布在 agents、agent_versions、sessions.agent_snapshot、code_sessions、thread 快照、deployment、batches、usage/billing、公开 API 和 SDK 示例中；全量改名是一次破坏性迁移，而收益只是“名字看起来一致”。
+- 如果只是希望控制台展示 LangRouter 的名字，可以增加 display alias，不需要改持久化 ID 和公共 API。
+
+推荐：保留 OMA 的完整 ID；用 slug 命名空间表达 Provider（例如 `langrouter/kimi-k2.5`）；在 OMA 模型代理内部解析到 LangRouter 的上游 ID；同时在 sandbox 模式下强制 Langcli 使用 Anthropic 协议，不依赖模型名是否命中 canonical 表。
+
 ### P0-2：LangRouter 硬编码出站与 Web 工具不兼容
+
+> 注意：如果部署方明确把 LangRouter 作为 sandbox 的模型 + Web provider，并让 `ANTHROPIC_BASE_URL` 指向 `https://api.langrouter.ai`，那么这不是“provider 选择错误”，而是 BYO LangRouter 架构。此时 WebSearch/WebFetch 走 LangRouter 是预期行为；本节的问题收缩为 OMA 策略/计费/审计旁路，以及下文 `ANTHROPIC_BASE_URL` 双用、附件解析和 key 注入问题。
 
 证据：
 
@@ -371,12 +401,69 @@ ACP 的合理用途：
 - 即使网络策略拦截，也会产生失败请求和启动噪声。
 - OMA 的 `/v2/ccr-sessions/{id}/web/search|fetch` 当前只由 Brain 使用；sandbox 的真实 Claude Code 不调用它们，因此 LangRouter 替换不会自动落到 OMA。
 
+**为什么不能只靠“放开 E2B 出站”解决**：
+
+1. **默认没有凭证，功能仍然是坏的**：Langcli 用 `ANTHROPIC_AUTH_TOKEN` 或 apiKeyHelper 作为 LangRouter Bearer。OMA sandbox 使用 OAuth FD，不设置 `ANTHROPIC_AUTH_TOKEN`，所以 WebSearch 会直接报无 token；放开网络也不会让它自动获得 LangRouter 凭证。
+2. **补上凭证就是凭证外泄**：如果把 OMA/OAuth token 写进 `ANTHROPIC_AUTH_TOKEN` 让 LangRouter 调用成功，就是把生命周期受限的 OMA 凭证发送给第三方域名，违反 OMA 的凭据边界。
+3. **绕过 OMA 的工具策略与服务端防护**：OMA 的 Web 工具合同包含环境 `allowed_hosts`、工具级 `allowed_domains`/`blocked_domains`、内容预算、SSRF/重定向校验、审计与计费；LangRouter 调用和 WebFetch 的本地直连都不经过这些服务端检查。放开出站相当于把这些限制一起放弃。
+4. **绕过计量与计费**：OMA 的 `/v2/ccr-sessions/{id}/web/search|fetch` 是计量和计费入口；直接请求 LangRouter 不会产生 OMA 的搜索用量和账单记录。
+5. **第三方依赖与可用性**：`refreshModelCapabilities()` 还会在启动后访问 `https://api.langrouter.ai/v1/models`，且该 fetch 没有超时；放开出站只是把“被网络策略拒绝”变成“依赖 LangRouter 可用性和延迟”，同时把模型能力缓存变成 LangRouter 的数据。
+6. **多租户/合规边界**：搜索词、目标 URL、页面内容会离开 OMA 的租户边界；即使部署方愿意放开出站，也不能默认所有租户都接受第三方检索服务。
+
 建议：
 
 - 方案 A（最小）：禁用 Langcli 的 WebSearch/WebFetch，或在 OMA 模式下把它们从工具列表中移除，由 Agent 配置决定。
 - 方案 B（推荐）：把两个 adapter 改为调用 OMA 的 session runtime Web 端点（带 session ingress token 与线程 header），让 OMA 统一执行域名策略、内容预算与计费。
 - 方案 C：恢复到上游 Anthropic server-tool 行为，但这会重新引入对 provider 能力的依赖。
-- 无论哪种，都必须删除 `api.langrouter.ai` 硬编码，并移除被注释掉的 privacy guard。
+- 无论哪种，都必须删除 `api.langrouter.ai` 硬编码，并移除被注释掉的 privacy guard。放开 E2B 出站不是替代方案，只是把可观测的失败换成不可控的第三方依赖和凭证暴露。
+
+**补充：如果每个 sandbox 使用“用户独享 API key”**
+
+需要先区分这把 key 的用途：
+
+| key 用途 | 效果 | 仍然存在的问题 |
+| --- | --- | --- |
+| 仅用于 LangRouter WebSearch/WebFetch | 解决“没有 LangRouter token”和“OMA 凭证发给第三方”的问题（因为 key 属于用户/LangRouter） | OMA 的环境/工具域名策略、内容预算、SSRF/重定向校验、计量计费、审计和租户数据边界仍被绕过；key 进入 sandbox 后仍可被工具读取/外泄，需要严格的 per-sandbox 注入、轮换和审计 |
+| 用于模型请求（Langcli 直连 LangRouter 或其他 provider） | 可以让 Langcli 不经过 OMA `/v1/messages` | OMA 失去 provider 隔离、模型目录一致性、usage/budget、模型请求观测、文件引用解析、错误转换和 per-agent 模型约束；这实际上变成“BYOK sandbox”架构，需要单独定义产品和计费合同 |
+| 是 OMA API key，用于 OMA `/v1/messages` | 可以作为 OMA 模型代理的鉴权 | 它不是 LangRouter key，WebSearch 仍然不能工作；而且把长期用户 API key 放进 sandbox，比 lifecycle-bound OAuth FD 更差 |
+
+如果目标是保留 OMA 的 Web 工具策略与计费，正确做法不是把 LangRouter key 放进 sandbox，而是让 key 留在 OMA/Vault 侧，由 OMA 执行 Web 工具。若产品上确实要支持“用户自带 LangRouter key”，应把它作为 OMA 的 provider/credential 配置，在 OMA 服务端使用，而不是下发给沙箱内的 Langcli。
+
+**如果用户独享 key 同时用于模型请求和 Web 工具，且 `ANTHROPIC_BASE_URL` 已指向 LangRouter**
+
+先确认两个实现细节：
+
+- Langcli 的 WebSearch/WebFetch 读取的是 `ANTHROPIC_AUTH_TOKEN` 或 apiKeyHelper，不读取 `ANTHROPIC_API_KEY`（`src/tools/WebSearchTool/adapters/apiAdapter.ts:25-29`、`src/tools/WebFetchTool/WebFetchTool.ts:46-50`）。因此用户 key 必须注入为 `ANTHROPIC_AUTH_TOKEN`，否则 WebSearch 仍会报无 token。
+- OMA 当前会注入 `anthropic_oauth` FD。如果该 FD 仍存在，Langcli 可能把它当作 Claude.ai 订阅认证，导致模型请求不使用用户 key。直连模式应移除 `anthropic_oauth` auth，或确保 `ANTHROPIC_AUTH_TOKEN` 的优先级并做实测。
+
+这时问题不再是“key 归谁”，而是“请求路径是否还经过 OMA”。直接让 Langcli 用这把 key 请求 LangRouter 会产生一个关键的运行时冲突：
+
+- Langcli 的 CCRv2 upstream proxy 与模型请求共用同一个 `ANTHROPIC_BASE_URL`（`src/upstreamproxy/upstreamproxy.ts:125-134`）。
+- OMA 当前之所以把 `ANTHROPIC_BASE_URL` 指向 OMA，是因为它同时要承载 `/v1/messages`、`/v1/code/upstreamproxy/ca-cert` 和 `/v1/code/upstreamproxy/ws`（`docs/design/be/ccrv2/upstream-proxy-and-model-runtime.md:18-24`）。
+- 如果把 `ANTHROPIC_BASE_URL` 改成 LangRouter，upstream proxy 会去请求 `https://api.langrouter.ai/v1/code/upstreamproxy/ca-cert` 和 `/ws`，这两个端点不存在，relay 会 fail-open 关闭。结果是 Bash/MCP/钩子子进程失去 OMA 的 `HTTPS_PROXY`、MITM、网络策略与凭据注入。
+- 如果不改 `ANTHROPIC_BASE_URL`，Langcli 的模型请求仍然会打到 OMA，不会使用用户 key 直连 LangRouter。
+- 同一变量还被 OMA Files 下载使用（`src/services/api/filesApi.ts:30`）；指向 LangRouter 后，依赖 OMA Files API 的下载路径会失效。
+- OMA 启动脚本设置 `GIT_SSL_CAINFO=/root/.ccr/ca-bundle.crt`；如果 upstream proxy 被关闭，该 CA bundle 可能不存在或不再更新，Git HTTPS 行为需要重新验证。
+
+除了这个冲突，直接模型请求还会失去：
+
+- OMA 的模型目录与 `{slug}/{upstream_model_id}` 解析；
+- `/v1/messages` 的 usage、session budget、计费、模型请求 span 和公开 `agent.message` / thinking 事件；
+- 托管文件引用（`source.type=file`）在模型请求前的解析与图片/PDF 转换；
+- 上游 401/403/5xx 的 OMA 错误转换、重试和 request ID 关联；
+- Agent snapshot 的 per-agent 模型约束；
+- Provider key 不进入 sandbox 的凭据边界。
+
+因此，如果必须让用户独享 key 参与模型请求，推荐顺序是：
+
+1. **推荐：把 LangRouter 注册为 OMA 的 LLM Provider，key 存 OMA/Vault，按用户/workspace 隔离；Langcli 继续使用 `/v1/messages`。** 这样用户仍然“用自己的 key 付费”，但 sandbox 只拿到 lifecycle-bound OAuth FD，OMA 继续保计费、预算、观测和模型目录。
+2. **次选：在 OMA 模型代理内部按用户选择 Provider/Key。** 需要扩展 OMA 的 Provider 归属模型（当前 Provider 是组织级；如果每个用户有独立 workspace，可先按 workspace 隔离）。
+3. **不推荐：Langcli 直连 LangRouter。** 如果确实要做，必须同时：
+   - 给 Langcli 增加独立的“模型 base URL”变量，不能复用 `ANTHROPIC_BASE_URL`，否则 upstream proxy 失效；
+   - 明确停用或旁路 OAuth FD，确保用户 key 的鉴权优先级；
+   - 重新定义 OMA 的 usage/budget/billing/observability 合同，接受客户端上报不可信；
+   - 对 Web 工具单独做策略、SSRF、内容预算和计量；
+   - 使用短生命周期、per-sandbox 的 token，而不是长期用户 key。
 
 ### P0-3：配置目录与技能发现不一致
 
@@ -443,11 +530,12 @@ Langcli 仓库没有声明基线 Claude Code 版本：
 
 结论：端点集合与载荷形状高度同源，但必须做真实差分验证，不能仅凭源码相似性判定兼容。
 
-### P1-4：打包与启动成本
+### P1-4：镜像集成与启动成本
 
+- `build.ts` 已经完成 bundle、vendor 复制、Node 兼容补丁和可执行产物；不需要另写打包器。
+- 剩余工作是镜像集成：安装 Node 20、复制整个 `dist/`、选择 `claude_path`/symlink/wrapper、注入 sandbox 环境变量。
+- `vendor/ripgrep` 必须随 dist 一起进入镜像，且架构匹配（linux amd64/arm64）；Linux 上复核 `cli.js` 与 `rg` 的可执行位。
 - Node 20 + 27 MiB bundle 的启动成本高于原生 Claude Code 二进制；需要测首 token 延迟和 sandbox 启动耗时。
-- `vendor/ripgrep` 必须随 dist 一起进入镜像，且架构匹配（linux amd64/arm64）。
-- wrapper 必须保证 `process.argv[1]`/`import.meta.url` 解析到 `dist/cli.js`，vendor 路径正确。
 - 若后续改用 `bun build --compile`，需要重新验证 `vendor` 路径、native 模块和 `feature()` 宏行为。
 
 ### P2：命名与可观测性
@@ -474,11 +562,11 @@ Langcli 仓库没有声明基线 Claude Code 版本：
 
 ### Phase 0：可行性 spike（先证明能跑通一轮）
 
-1. 构建 Linux amd64/arm64 的 Langcli dist，确认 `dist/cli.js` 与 `vendor/` 完整。
+1. 直接运行 `bun run build` 生成 `dist/cli.js` 与 `dist/vendor/`（`build.ts` 已覆盖 bundle、vendor 复制和 Node 兼容补丁）。
 2. 制作测试镜像层：
    - Node 20；
-   - `/opt/langcli/dist`、`/opt/langcli/vendor`；
-   - wrapper `/opt/claude-code/bin/claude`（或直接配置 `environment_runner.claude_path`）。
+   - 复制整个 `dist/` 到 `/opt/langcli/dist`（包含 `vendor/`）；
+   - wrapper `/opt/claude-code/bin/claude`（或直接配置 `environment_runner.claude_path=/opt/langcli/dist/cli.js`，或 symlink）。
 3. wrapper 至少设置：
    - `CLAUDE_CONFIG_DIR=/root/.claude`
    - `DISABLE_AUTOUPDATER=1`
